@@ -1,0 +1,22 @@
+services:
+  - type: web
+    name: docusense
+    runtime: docker
+    plan: free
+    region: singapore
+    branch: main
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /api/health
+    envVars:
+      - key: AUTH_REQUIRED
+        value: "true"
+      - key: APP_USERNAME
+        sync: false
+      - key: APP_PASSWORD
+        sync: false
+      - key: DATABASE_URL
+        value: sqlite:////tmp/docusense/docusense.db
+      - key: DATA_DIR
+        value: /tmp/docusense
+      - key: MAX_UPLOAD_MB
+        value: "15"

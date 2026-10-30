@@ -1,8 +1,9 @@
-import csv, io, json, os, re, uuid
+import base64, binascii, csv, hmac, io, json, os, re, uuid
 from pathlib import Path
-from fastapi import Depends, FastAPI, File, HTTPException, Query, UploadFile
+from fastapi import Depends, FastAPI, File, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, Response, StreamingResponse
+from fastapi.staticfiles import StaticFiles
 from sqlalchemy import func, inspect, or_, select
 from sqlalchemy.orm import Session
 from .database import Base, SessionLocal, engine, get_db
@@ -14,9 +15,57 @@ DATA_DIR = Path(os.getenv("DATA_DIR", "./data" )).resolve()
 UPLOAD_DIR = DATA_DIR / "uploads"
 MAX_BYTES = int(os.getenv("MAX_UPLOAD_MB", "15")) * 1024 * 1024
 ALLOWED = {"application/pdf": ".pdf", "image/png": ".png", "image/jpeg": ".jpg"}
-app = FastAPI(title="DocuSense API", version="0.1.0")
+AUTH_REQUIRED = os.getenv("AUTH_REQUIRED", "false").lower() == "true"
+APP_USERNAME = os.getenv("APP_USERNAME", "")
+APP_PASSWORD = os.getenv("APP_PASSWORD", "")
+STATIC_DIR = Path(os.getenv("STATIC_DIR", "./static")).resolve()
+if AUTH_REQUIRED and (not APP_USERNAME or not APP_PASSWORD):
+    raise RuntimeError("AUTH_REQUIRED=true needs APP_USERNAME and APP_PASSWORD")
+if AUTH_REQUIRED and len(APP_PASSWORD) < 16:
+    raise RuntimeError("APP_PASSWORD must be at least 16 characters when authentication is enabled")
+
+app = FastAPI(
+    title="DocuSense API",
+    version="0.1.0",
+    docs_url=None if AUTH_REQUIRED else "/docs",
+    redoc_url=None if AUTH_REQUIRED else "/redoc",
+    openapi_url=None if AUTH_REQUIRED else "/openapi.json",
+)
 origins = os.getenv("CORS_ORIGINS", "http://localhost:5173").split(",")
-app.add_middleware(CORSMiddleware, allow_origins=origins, allow_methods=["GET", "POST", "PATCH"], allow_headers=["*"])
+app.add_middleware(CORSMiddleware, allow_origins=origins, allow_methods=["GET", "POST", "PATCH"], allow_headers=["Authorization", "Content-Type"])
+
+
+def _valid_basic_credentials(header: str | None) -> bool:
+    if not header or not header.startswith("Basic "):
+        return False
+    try:
+        decoded = base64.b64decode(header[6:], validate=True).decode("utf-8")
+        username, password = decoded.split(":", 1)
+    except (binascii.Error, UnicodeDecodeError, ValueError):
+        return False
+    username_matches = hmac.compare_digest(username, APP_USERNAME)
+    password_matches = hmac.compare_digest(password, APP_PASSWORD)
+    return username_matches & password_matches
+
+
+@app.middleware("http")
+async def protect_api(request: Request, call_next):
+    is_api = request.url.path.startswith("/api/")
+    is_public_health = request.url.path == "/api/health"
+    if AUTH_REQUIRED and is_api and not is_public_health and request.method != "OPTIONS":
+        if not _valid_basic_credentials(request.headers.get("authorization")):
+            return Response(
+                content='{"detail":"Authentication required"}',
+                status_code=401,
+                media_type="application/json",
+                headers={"Cache-Control": "no-store"},
+            )
+    response = await call_next(request)
+    if AUTH_REQUIRED and is_api:
+        response.headers["Cache-Control"] = "no-store"
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["Referrer-Policy"] = "no-referrer"
+    return response
 
 @app.on_event("startup")
 def startup():
@@ -231,3 +280,7 @@ def _spreadsheet_safe(value):
     if isinstance(value, str) and value.startswith(("=", "+", "-", "@", "\t", "\r")):
         return "'" + value
     return value
+
+
+if STATIC_DIR.is_dir():
+    app.mount("/", StaticFiles(directory=STATIC_DIR, html=True), name="frontend")
